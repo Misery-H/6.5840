@@ -4,6 +4,7 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/tester1"
+	"time"
 )
 
 type Clerk struct {
@@ -37,8 +38,10 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 			if reply.Err == rpc.OK || reply.Err == rpc.ErrNoKey {
 				return reply.Value, reply.Version, reply.Err
 			}
+			// unexpected server-side error, retry
 		}
-		// RPC failed or unexpected error, retry
+		// RPC dropped, retry after delay
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -67,21 +70,24 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	for {
 		ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
 		if ok {
-			if reply.Err == rpc.OK {
+			switch reply.Err {
+			case rpc.OK:
 				return rpc.OK
-			}
-			if reply.Err == rpc.ErrVersion {
+			case rpc.ErrVersion:
 				if firstAttempt {
 					return rpc.ErrVersion
 				} else {
+					// Might be due to re-sent request, and server already handled the first
 					return rpc.ErrMaybe
 				}
-			}
-			if reply.Err == rpc.ErrNoKey {
+			case rpc.ErrNoKey:
 				return rpc.ErrNoKey
+			default:
+				// Unexpected error, retry
 			}
-			// else: retry
 		}
+		// RPC dropped, retry after delay
 		firstAttempt = false
+		time.Sleep(100 * time.Millisecond)
 	}
 }
