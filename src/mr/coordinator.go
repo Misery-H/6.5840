@@ -23,34 +23,36 @@ const (
 )
 
 type Task struct {
-	Filename   []string //为要处理的文件
-	Taskname   int      //输出时的格式，例如mr-1
-	Tasktype   int      //约定0为map，1为reduce,2为等待
-	ReduceNum  int      //reduce的数量
-	startTime  time.Time
-	TaskStatus int // 任务状态
+	Filename   []string  // 要处理的文件列表
+	Taskname   int       // 输出时的格式，例如 mr-1
+	Tasktype   int       // 约定0为map，1为reduce,2为等待
+	ReduceNum  int       // reduce 的数量
+	startTime  time.Time // 任务开始时间
+	TaskStatus int       // 任务状态
 }
 
 type Coordinator struct {
-	// Your definitions here.
-	State        int        // Map Reduce阶段
-	MapChan      chan *Task // Map任务channel
-	ReduceChan   chan *Task // Reduce任务channel
-	ReduceNum    int        // Reduce的数量
-	Files        []string   // 文件
+	// 状态相关
+	State       int  // Map 或 Reduce 阶段
+	MapReady    bool // 是否所有 map 任务完成
+	ReduceReady bool // 是否所有 reduce 任务完成
+
+	// 任务通道和任务状态记录
+	MapChan      chan *Task // Map任务通道
+	ReduceChan   chan *Task // Reduce任务通道
 	MapStatus    map[int]*Task
-	MapReady     bool // 记录map任务完成的数量
 	ReduceStatus map[int]*Task
-	ReduceReady  bool // 记录reduce任务完成的数量
-	mu           sync.Mutex
-	cond         *sync.Cond //用于map通知
+
+	// 其他信息
+	ReduceNum int      // Reduce 任务数量
+	Files     []string // 文件列表
+
+	// 同步相关
+	mu   sync.Mutex
+	cond *sync.Cond // 条件变量，用于等待状态变化
 }
 
-//var (
-//	lock sync.Locker
-//)
-
-// Your code here -- RPC handlers for the worker to call.
+// RPC处理函数：任务分配
 func (c *Coordinator) TaskAssignment(args *GetTaskArgs, reply *Task) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -60,26 +62,23 @@ func (c *Coordinator) TaskAssignment(args *GetTaskArgs, reply *Task) error {
 			return nil
 		} else {
 			current_task := <-c.MapChan
-			//记录开始时间
+			// 记录任务开始时间，并设置状态为处理中
 			current_task.startTime = time.Now()
 			current_task.TaskStatus = InProcess
 			*reply = *current_task
 			c.MapStatus[current_task.Taskname] = current_task
-			//fmt.Printf("Assign:%p\n", current_task)
 		}
 	} else if c.State == Reducetask {
 		if len(c.ReduceChan) == 0 {
-			//fmt.Println("in reduce task")
 			reply.Tasktype = Waittask
 			return nil
 		} else {
 			current_task := <-c.ReduceChan
-			//记录开始时间
+			// 记录任务开始时间，并设置状态为处理中
 			current_task.startTime = time.Now()
 			current_task.TaskStatus = InProcess
 			*reply = *current_task
 			c.ReduceStatus[current_task.Taskname] = current_task
-
 		}
 	} else if c.State == Exittask {
 		reply.Tasktype = Exittask
@@ -87,7 +86,10 @@ func (c *Coordinator) TaskAssignment(args *GetTaskArgs, reply *Task) error {
 	}
 	return nil
 }
+
+// 初始化任务：产生 map 和 reduce 任务
 func (c *Coordinator) TaskProduce(files []string, nReduce int) {
+	// 因为该函数在单线程调用阶段执行，所以无需加锁
 	for i := 0; i < len(files); i++ {
 		t := &Task{
 			Filename:   []string{files[i]},
@@ -97,12 +99,10 @@ func (c *Coordinator) TaskProduce(files []string, nReduce int) {
 			startTime:  time.Time{},
 			TaskStatus: Wait,
 		}
-		//fmt.Printf("init:%p\n", t)
 		c.MapChan <- t
 		c.MapStatus[t.Taskname] = t
-		//fmt.Println("init map task", i)
 	}
-	//默认中间文件有len(files) * nReduce个,直接造出Reduce任务
+	// 直接构造 reduce 任务（中间文件为 len(files)*nReduce 个）
 	for i := 0; i < nReduce; i++ {
 		ReduceFiles := make([]string, 0)
 		for j := 0; j < len(files); j++ {
@@ -118,78 +118,86 @@ func (c *Coordinator) TaskProduce(files []string, nReduce int) {
 		}
 		c.ReduceChan <- t
 		c.ReduceStatus[t.Taskname] = t
-		//fmt.Println("init reduce task", i)
 	}
-
 }
+
+// RPC处理函数：Map任务完成
 func (c *Coordinator) MapDone(args *Task, reply *Task) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.MapStatus[args.Taskname] = args
-	*reply = *args     // 修复值复制问题
-	c.cond.Broadcast() // 通知状态变化
+	*reply = *args     // 值复制
+	c.cond.Broadcast() // 通知等待中的协程
 	return nil
 }
+
+// RPC处理函数：Reduce任务完成
 func (c *Coordinator) ReduceDone(args *Task, reply *Task) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.ReduceStatus[args.Taskname] = args
-	*reply = *args     // 修复值复制问题
-	c.cond.Broadcast() // 通知状态变化
+	*reply = *args     // 值复制
+	c.cond.Broadcast() // 通知等待中的协程
 	return nil
 }
+
+// 心跳检测：定期检测任务超时情况并重分配任务
 func (c *Coordinator) heartCheck() {
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 
-		for !c.MapReady {
-			<-ticker.C // 定期触发
+		// 检查 Map 任务
+		for {
 			c.mu.Lock()
-
+			if c.MapReady {
+				c.mu.Unlock()
+				break
+			}
 			for _, v := range c.MapStatus {
 				if v.TaskStatus == InProcess && !v.startTime.IsZero() && time.Since(v.startTime) > 10*time.Second {
-					//fmt.Println("Map task", v.Filename, "timeout, reassigning task")
-					// 任务超时，重置状态
+					// 超时重置任务状态并重新放入任务队列
 					v.TaskStatus = Wait
 					v.startTime = time.Time{}
-					// 重新放回任务队列
 					select {
 					case c.MapChan <- v:
 					default:
-						//fmt.Println("Map task queue full, unable to reassign task immediately")
+						// 如果任务通道已满，则暂不处理
 					}
 				}
 			}
-
 			c.mu.Unlock()
+			<-ticker.C
 		}
-		for !c.ReduceReady {
-			<-ticker.C // 定期触发
-			c.mu.Lock()
 
+		// 检查 Reduce 任务
+		for {
+			c.mu.Lock()
+			if c.ReduceReady {
+				c.mu.Unlock()
+				break
+			}
 			for _, v := range c.ReduceStatus {
 				if v.TaskStatus == InProcess && !v.startTime.IsZero() && time.Since(v.startTime) > 10*time.Second {
-					//fmt.Println("Reduce task", v.Filename, "timeout, reassigning task")
-					// 任务超时，重置状态
+					// 超时重置任务状态并重新放入任务队列
 					v.TaskStatus = Wait
 					v.startTime = time.Time{}
-					// 重新放回任务队列
 					select {
 					case c.ReduceChan <- v:
 					default:
-						//fmt.Println("Reduce task queue full, unable to reassign task immediately")
+						// 如果任务通道已满，则暂不处理
 					}
 				}
 			}
-
 			c.mu.Unlock()
+			<-ticker.C
 		}
 	}()
 }
 
+// 检查 Map 任务状态：等待所有 map 任务完成后转为 Reduce 阶段
 func (c *Coordinator) checkMapStatus() {
 	go func() {
 		c.mu.Lock()
@@ -205,12 +213,15 @@ func (c *Coordinator) checkMapStatus() {
 			if allDone {
 				c.MapReady = true
 				c.State = Reducetask
+				c.cond.Broadcast() // 通知其他等待的协程
 				return
 			}
-			c.cond.Wait() // 使用条件变量等待通知
+			c.cond.Wait() // 等待状态变化
 		}
 	}()
 }
+
+// 检查 Reduce 任务状态：等待所有 reduce 任务完成后退出任务调度
 func (c *Coordinator) checkReduceStatus() {
 	go func() {
 		c.mu.Lock()
@@ -225,18 +236,19 @@ func (c *Coordinator) checkReduceStatus() {
 			}
 			if allDone {
 				c.ReduceReady = true
-				//fmt.Println("Reduce tasks completed")
 				c.State = Exittask
+				c.cond.Broadcast() // 通知等待中的协程
 				return
 			}
-			c.cond.Wait() // 使用条件变量等待通知
+			c.cond.Wait() // 等待状态变化
 		}
 	}()
 }
+
+// 启动 RPC 服务
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -246,15 +258,17 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-// main/mrcoordinator.go calls Done() periodically to find out
-// if the entire job has finished.
+// Done 方法：返回任务是否全部完成
 func (c *Coordinator) Done() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.State == Exittask
 }
 
+// 构造 Coordinator 对象
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		State:        0,
+		State:        Maptask,
 		MapChan:      make(chan *Task, len(files)),
 		ReduceChan:   make(chan *Task, nReduce),
 		ReduceNum:    nReduce,
@@ -264,6 +278,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		MapReady:     false,
 		ReduceReady:  false,
 	}
+	c.mu = sync.Mutex{}
 	c.cond = sync.NewCond(&c.mu)
 	c.TaskProduce(files, nReduce)
 	c.checkMapStatus()
@@ -271,6 +286,5 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.checkReduceStatus()
 	c.server()
 
-	//c.checkReduceStatus()
 	return &c
 }
